@@ -1,0 +1,191 @@
+---
+title: "Prediction Assignment Write-up"
+author: "Dominique Loete"
+date: "30 januari 2016"
+output: html_document
+---
+
+### Executive Summary
+Using data from a study on the quality of weight lifting action [(ref. 1)](#Paper) I created a model for predicting the outcome based on 14 variables. A ***random forest model with 10-fold cross-validation*** is chosen to build the model and it is tested to have an accuracy of ***100%*** in-sample and an out-of-sample error rate of just ***2.04%***.
+
+
+### Exploratory Data Analysis
+This project requires the prediction of the quality of weight lifting action based on data gathered from test subjects [(ref. 1)](#Paper). To do this prediction consistently, I not only load the required libraries, but also set the seed to a fixed number, namely 323.
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+options(warn=-1)
+library(foreach)
+library(caret)
+library(ggplot2)
+library(randomForest)
+library(gbm)
+library(doParallel)
+library(plyr)
+library(rpart)
+library(rpart.plot)
+library(corrplot)
+set.seed(323)
+```
+
+Download the data:
+```{r}
+trainUrl <-"https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+testUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+trainFile <- "./data/pml-training.csv"
+testFile  <- "./data/pml-testing.csv"
+if (!file.exists("./data")) {
+  dir.create("./data")
+}
+if (!file.exists(trainFile)) {
+  download.file(trainUrl, destfile=trainFile, method="curl")
+}
+if (!file.exists(testFile)) {
+  download.file(testUrl, destfile=testFile, method="curl")
+}
+```
+
+Next step is the loading of the data. The data is present in the directory ***data*** and contains some strings "#DIV/0!", which need to be altered to *NA* values:
+```{r, echo=TRUE}
+raw_training_data <- read.csv("./data/pml-training.csv", na.strings = "#DIV/0!", row.names = 1)
+raw_evaluation_data <- read.csv("./data/pml-testing.csv", na.strings = "#DIV/0!", row.names = 1)
+dim(raw_training_data)
+dim(raw_evaluation_data)
+```
+So 19622 observations of 159 variables with ***classe*** being the outcome. And 20 test samples where the ***classe*** needs to be predicted.
+
+### Data cleaning
+
+The training dataset contains a lot of variables, and also many NA values for those variables.
+So first step will be to clean up the dataset by removing near zero covariates and variables which have missing values, since they will have very little use in the prediction model.
+```{r, echo=TRUE}
+training_data <- raw_training_data[, colSums(is.na(raw_training_data)) == 0] 
+evaluation_data <- raw_evaluation_data[, colSums(is.na(raw_evaluation_data)) == 0] 
+nsv <- nearZeroVar(training_data, saveMetrics = TRUE)
+training_data <- training_data[, !nsv$nzv]
+evaluation_data <- evaluation_data[, !nsv$nzv]
+names(training_data)
+```
+
+The non-usable variables for prediction should also be removed from the training and evaluation set, so those are the timestamps, usernames and num_window. And all columns apart from ***classe*** should be numeric.
+```{r, echo=TRUE}
+training_data <- training_data[,-(1:5)] 
+for(i in c(2:ncol(training_data)-1)) {training_data[,i] = as.numeric(as.character(training_data[,i]))}
+evaluation_data <- evaluation_data[,-(1:5)]
+for(i in c(2:ncol(evaluation_data)-1)) {evaluation_data[,i] = as.numeric(as.character(evaluation_data[,i]))}
+dim(training_data)
+```
+
+In a further attempt to reduce the dataset (and thus save on computational/resource need), I tried to get rid of unimportant variables. I did this by using a correlation matrix to only leave predictors in the dataset with a correlation to the outcome of more than 0.05. See also [Figure 1](#Figure 1).
+```{r, echo=TRUE}
+cor_test <- training_data
+cor_test$classe <- as.numeric(cor_test$classe)
+cor.mtest <- function(mat, ...) {
+    mat <- as.matrix(mat)
+    n <- ncol(mat)
+    p.mat<- matrix(NA, n, n)
+    diag(p.mat) <- 0
+    for (i in 1:(n - 1)) {
+        for (j in (i + 1):n) {
+            tmp <- cor.test(mat[, i], mat[, j], ...)
+            p.mat[i, j] <- p.mat[j, i] <- tmp$p.value
+        }
+    }
+    colnames(p.mat) <- rownames(p.mat) <- colnames(mat)
+    p.mat
+}
+p.mat <- cor.mtest(cor_test)
+cor_predictors <- p.mat[53,p.mat[53,] > 0.05]
+```
+The most correlated predictors with the outcome are:
+```{r}
+names(cor_predictors)
+```
+The rest is removed from the datasets.
+```{r,echo=TRUE}
+training_data <- training_data[,c(names(cor_predictors),"classe")]
+evaluation_data <- evaluation_data[,c(names(cor_predictors),"problem_id")]
+```
+This leaves a training dataset with 14 predictors and the outcome ***classe***.
+The training dataset looks to be ready for the creation of our prediction model.
+
+
+### Building prediction model
+
+I divide the training dataset into an actual training set (60% of the dataset) and an validation set (40% of the observations). After I am happy with my prediction model, I will use it to predict on the given ***testing*** dataset as evaluation for Coursera.
+```{r, echo=TRUE}
+inTrain <- createDataPartition(y=training_data$classe, p=0.6, list=FALSE)
+training <- training_data[inTrain,]
+testing <- training_data[-inTrain,]
+```
+
+The plan is to try a few different models and see which gives a good enough performance of accuracy. If it turns out we don't reach ~99% accuracy with just a single model, then a combination will be tried.
+In an attempt to minimize overfitting, I will use a 10-fold cross-validation in the models. The models will be run in parallel to speed up the fitting.
+```{r, echo=TRUE, cache=TRUE}
+cl <- makeCluster(detectCores(), type='PSOCK')
+registerDoParallel(cl)
+mod_gbm <- train(classe ~ . , method = "gbm", data = training, 
+                 trControl = trainControl(method = "cv", number = 10))
+registerDoSEQ()
+cl <- makeCluster(detectCores(), type='PSOCK')
+registerDoParallel(cl)
+mod_rf <- train(classe ~ . , method = "rf", data = training, importance = TRUE, 
+                trControl = trainControl(method = "cv", number = 10))
+registerDoSEQ()
+```
+
+I chose to try a boosting model (**gbm**) and use the **random forest** model. 
+The performance of those models, that is the In-Sample Error Rate (*1-accuracy*):
+```{r, echo=TRUE}
+test_gbm <- predict(mod_gbm, training)
+test_rf <- predict(mod_rf, training)
+confusionMatrix(test_gbm,training$classe)$overall[c(1,3,4)]
+confusionMatrix(test_rf, training$classe)$overall[c(1,3,4)]
+```
+This results in an accuracy of 90.1% (95% CI: 98.59%, 90.67%) or 9.9% error-rate for the GBM model and a stunning 100% (95% CI: 99.97%, 100%) accuracy for the random forest model, thus 0% In-Sample Error-rate. This accuracy might be considered over-fitting of the model and result in a bad performance on real world usage, but with a 10-fold cross-validation and nature of random forests this should be a good enough model to use. So, the choice is clear: the **Random Forest** model.(See [Figure 2](#Figure 2) for the visualization of a decision tree)
+
+### Testing prediction model
+Now the model should be tested. And hopefully the Out-of-Sample Error Rate is also good.
+```{r, echo=TRUE}
+pred_rf <- predict(mod_rf, testing)
+confusionMatrix(pred_rf,testing$classe)$overall[c(1,3,4)]
+```
+The model achieves an accuracy of 97.96% on the *testing* dataset, that is an expected Out-of-Sample Error Rate (1-Accuracy) of **2.04%**. This error rate is very decent and should be sufficient to predict the correct outcomes for the twenty samples, which were given as a test quiz. 
+
+
+### Prediction Test data
+The last step is predicting the outcomes of the twenty test samples:
+```{r, echo=TRUE}
+pred_eval <- predict(mod_rf, evaluation_data)
+pred_eval
+```
+These prediction will be submitted to the ***Course Project Prediction Quiz*** for grading.
+
+
+### References
+<a name="Paper">[1]</a>: [Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.
+
+Read more: http://groupware.les.inf.puc-rio.br/har#ixzz3yjdCJ4dS](http://groupware.les.inf.puc-rio.br/har)
+
+### Appendix
+<a name="Figure 1">
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+col <- colorRampPalette(c("#BB4444", "#EE9988", "#FFFFFF", "#77AADD", "#4477AA"))
+corrplot(p.mat[c(names(cor_predictors),"classe"),c(names(cor_predictors),"classe")],
+         method="color", col=col(200),  
+         type="lower", order="FPC", 
+         addCoef.col = "black",
+         addCoefasPercent = TRUE,
+         tl.col="black", tl.srt=30, #Text label color and rotation
+         # Combine with significance
+         p.mat = p.mat, sig.level = 0.05, insig = "blank", 
+         # hide correlation coefficient on the principal diagonal
+         diag=FALSE, title = "Figure 1: Correlation matrix (in %)",
+         mar=c(0,0,1,0)
+         )
+```
+
+<a name="Figure 2">
+```{r, echo=FALSE, message=FALSE}
+treeModel <- rpart(classe ~ ., data=training, method="class")
+prp(treeModel, main="Figure 2: TreeModel with probability of the fitted class", extra=8)
+```
+</a>
